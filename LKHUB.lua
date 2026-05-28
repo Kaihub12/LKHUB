@@ -81,6 +81,102 @@ local killAuraIndicatorCircle = nil  -- [ADDED v7.3.3] Kill Aura circle on curre
 -- repairAura state managed by startRepairAura/stopRepairAura
 local repairAuraConn = nil
 
+-- Weapon inspector
+local weaponInspectorConn = nil
+
+local function stopWeaponInspector()
+    if weaponInspectorConn then
+        weaponInspectorConn:Disconnect()
+        weaponInspectorConn = nil
+    end
+end
+
+local function startWeaponInspector()
+    stopWeaponInspector()
+    -- Print current if equipped
+    printEquippedWeaponInfo()
+    weaponInspectorConn = LocalPlayer.CharacterAdded:Connect(function(char)
+        -- when character spawns, listen for tools being parented
+        char.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") then
+                task.delay(0.1, printEquippedWeaponInfo)
+            end
+        end)
+    end)
+end
+
+-- Save a preset for currently equipped weapon (uses tool.Name as key)
+local function savePresetForEquipped()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then Library:Notify({ Title = "Preset", Description = "No tool equipped to save.", Time = 2 }); return end
+    local key = tool.Name
+    weaponPresets[key] = {
+        meleeMult = performanceConfig.rapidFireMeleeMultiplier,
+        rangedMult = performanceConfig.rapidFireRangedMultiplier,
+        animSpeed = Options.MeleeAnimSpeed and Options.MeleeAnimSpeed.Value or 1,
+    }
+    Library:Notify({ Title = "Preset", Description = "Saved preset for: " .. key, Time = 2 })
+end
+
+local function applyPresetForEquipped(presetName)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then Library:Notify({ Title = "Preset", Description = "No tool equipped to apply.", Time = 2 }); return end
+    local key = presetName or tool.Name
+    local p = weaponPresets[key]
+    if not p then Library:Notify({ Title = "Preset", Description = "No preset found for: " .. key, Time = 2 }); return end
+    performanceConfig.rapidFireMeleeMultiplier = p.meleeMult or performanceConfig.rapidFireMeleeMultiplier
+    performanceConfig.rapidFireRangedMultiplier = p.rangedMult or performanceConfig.rapidFireRangedMultiplier
+    if Options.MeleeAnimSpeed then Options.MeleeAnimSpeed.Value = p.animSpeed or (Options.MeleeAnimSpeed.Value or 1) end
+    Library:Notify({ Title = "Preset", Description = "Applied preset for: " .. key, Time = 2 })
+end
+
+local function updateWeaponInfoUI()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if weaponInfoNameLabel then
+        if tool then
+            weaponInfoNameLabel.Text = "Equipped: " .. tool.Name
+            local inferred = getWeaponSwingSpeed()
+            weaponInfoSpeedLabel.Text = "Inferred Speed: " .. string.format("%.3f s", inferred)
+            -- compute suggested multiplier: default heuristics
+            local suggested = nil
+            if inferred and inferred > 0 then
+                suggested = math.clamp((inferred / (Options.KillAuraSwingRate and Options.KillAuraSwingRate.Value or inferred)) , 1, 4)
+            end
+            local sText = suggested and string.format("Suggested Mult: %.2fx", suggested) or "Suggested Mult: n/a"
+            weaponInfoSuggestedLabel.Text = sText
+        else
+            weaponInfoNameLabel.Text = "Equipped: none"
+            weaponInfoSpeedLabel.Text = "Inferred Speed: -"
+            weaponInfoSuggestedLabel.Text = "Suggested Mult: -"
+        end
+    end
+    -- update preset dropdown values
+    if weaponInfoPresetDropdown then
+        local vals = {}
+        for k in pairs(weaponPresets) do table.insert(vals, k) end
+        table.sort(vals)
+        if #vals > 0 then
+            pcall(function() weaponInfoPresetDropdown:SetValues(vals) end)
+        end
+    end
+end
+
+-- Hook character/tool events to keep info live
+weaponInfoConn = LocalPlayer.CharacterAdded:Connect(function(char)
+    char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then task.delay(0.1, updateWeaponInfoUI) end
+    end)
+    char.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") then task.delay(0.1, updateWeaponInfoUI) end
+    end)
+end)
+table.insert(connections, weaponInfoConn)
+
 local originalLighting = { stored = false }
 local originalFog = { stored = false }
 
@@ -92,13 +188,135 @@ local bhopConn = nil  -- [ADDED v7.3] Bunny Hop connection
 -- [REMOVED v7.3.1] No Stamina Drain - game uses hunger, not stamina
 local remoteSpyEnabled = false  -- [ADDED v7.3] Remote Spy state
 local remoteSpyLogs = {}  -- [ADDED v7.3] Remote call logs
+-- Script log system (UI panel + buffer)
+local scriptLogs = {}
+local logGui = nil
+local logTextBox = nil
+local logVisible = false
+
+local function addScriptLog(level, text)
+    local time = os.date("%H:%M:%S")
+    local entry = string.format("[%s] [%s] %s", time, level or "INFO", text)
+    table.insert(scriptLogs, entry)
+    if #scriptLogs > 200 then table.remove(scriptLogs, 1) end
+    -- print to dev console as well
+    print(entry)
+    -- update UI if visible
+    if logTextBox then
+        local out = table.concat(scriptLogs, "\n")
+        pcall(function() logTextBox.Text = out end)
+    end
+end
+
+local function createLogGui()
+    if logGui and logGui.Parent then return end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if not playerGui then return end
+    logGui = Instance.new("ScreenGui")
+    logGui.Name = "LKHUB_LogGui"
+    logGui.ResetOnSpawn = false
+    logGui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "LogFrame"
+    frame.Size = UDim2.new(0, 420, 0, 240)
+    frame.Position = UDim2.new(1, -430, 1, -250)
+    frame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+    frame.BorderSizePixel = 0
+    frame.AnchorPoint = Vector2.new(0,0)
+    frame.Parent = logGui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 22)
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(255,255,255)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.Text = "LKHUB Script Log"
+    title.Parent = frame
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 20, 0, 20)
+    closeBtn.Position = UDim2.new(1, -24, 0, 2)
+    closeBtn.Text = "X"
+    closeBtn.Font = Enum.Font.Gotham
+    closeBtn.TextSize = 14
+    closeBtn.Parent = frame
+    closeBtn.MouseButton1Click:Connect(function()
+        logGui.Enabled = false
+        logVisible = false
+    end)
+
+    logTextBox = Instance.new("TextBox")
+    logTextBox.Size = UDim2.new(1, -8, 1, -32)
+    logTextBox.Position = UDim2.new(0, 4, 0, 26)
+    logTextBox.BackgroundColor3 = Color3.fromRGB(10,10,10)
+    logTextBox.TextColor3 = Color3.fromRGB(220,220,220)
+    logTextBox.TextWrapped = true
+    logTextBox.TextXAlignment = Enum.TextXAlignment.Left
+    logTextBox.TextYAlignment = Enum.TextYAlignment.Top
+    logTextBox.Font = Enum.Font.Code
+    logTextBox.TextSize = 12
+    logTextBox.ClearTextOnFocus = false
+    logTextBox.MultiLine = true
+    logTextBox.Parent = frame
+    logTextBox.Text = table.concat(scriptLogs, "\n")
+end
+
+local function toggleLogGui()
+    if not logGui then createLogGui() end
+    if not logGui then return end
+    logVisible = not logVisible
+    logGui.Enabled = logVisible
+end
+
+local function clearScriptLogs()
+    scriptLogs = {}
+    if logTextBox then pcall(function() logTextBox.Text = "" end) end
+end
+
+local function runSelfTest()
+    addScriptLog("TEST", "Starting self-test...")
+    local ok = true
+    -- Test 1: Remotes availability
+    if pickUpItemRemote then addScriptLog("OK", "PickUpItem remote found") else addScriptLog("WARN", "PickUpItem remote missing") ok = false end
+    if placeStructureRemote then addScriptLog("OK", "PlaceStructure remote found") else addScriptLog("WARN", "PlaceStructure remote missing") end
+    if buyItemRemote then addScriptLog("OK", "BuyItem remote found") else addScriptLog("WARN", "BuyItem remote missing") end
+    -- Test 2: Weapon speed inference
+    local speed = getWeaponSwingSpeed()
+    if type(speed) == "number" then addScriptLog("OK", "getWeaponSwingSpeed() returned " .. tostring(speed)) else addScriptLog("ERR", "getWeaponSwingSpeed() failed") ok = false end
+    -- Test 3: Basic utility functions
+    local success, err = pcall(function() getItemMainPart(LocalPlayer.Character or workspace) end)
+    if success then addScriptLog("OK", "getItemMainPart() callable") else addScriptLog("ERR", "getItemMainPart() error: " .. tostring(err)); ok = false end
+    -- Test 4: UI presence
+    if Library and Window then addScriptLog("OK", "UI library present") else addScriptLog("ERR", "UI library missing") ok = false end
+    addScriptLog("TEST", "Self-test complete")
+    return ok
+end
 
 -- ============================================
 -- NEW FEATURE STATES (v8.4)
 -- ============================================
-local rapidFireConn = nil
-local rapidFireLastSwing = 0
-local rapidFireActive = false
+local rapidFireMeleeConn = nil
+local rapidFireMeleeLastSwing = 0
+local rapidFireMeleeActive = false
+local rapidFireRangedConn = nil
+local rapidFireRangedLastFire = 0
+local rapidFireRangedActive = false
+local rapidFireMeleeStats = { intervals = {}, last = nil }
+local rapidFireAutoTuneAdjust = 0.05
+local rapidFireAutoTuneActive = false
+local rapidFireErrorCounts = { melee = {count = 0, last = 0}, ranged = {count = 0, last = 0} }
+
+-- Weapon presets: map tool name -> { meleeMult, rangedMult, animSpeed }
+local weaponPresets = {}
+
+-- UI state for weapon info
+local weaponInfoNameLabel = nil
+local weaponInfoSpeedLabel = nil
+local weaponInfoSuggestedLabel = nil
+local weaponInfoPresetDropdown = nil
+local weaponInfoConn = nil
 local performanceModeActive = false
 local antiLagConn = nil
 local autoRejoinActive = false
@@ -113,8 +331,10 @@ local mobNames = {"Runner", "Crawler", "Riot", "Zombie", "Brute", "Spitter", "Bo
 -- ============================================
 local performanceConfig = {
     enablePerformanceMode = false,
-    rapidFireMultiplier = 1.5,  -- attack speed multiplier
-    maxRapidFireRate = 0.15,  -- minimum delay between swings (seconds)
+    rapidFireMeleeMultiplier = 1.5,  -- melee attack speed multiplier
+    rapidFireRangedMultiplier = 1.2, -- ranged fire multiplier
+    maxRapidFireRate = 0.08,  -- minimum delay between swings/fires (seconds)
+    safetyMaxAttacksPerSecond = 12, -- safety cap
 }
 
 -- ============================================
@@ -1263,21 +1483,47 @@ end
 -- [ADDED v8.4] Accelerates basic attacks by reducing the weapon swing interval.
 -- Works with any weapon that has Swing/HitTargets/RemoteClick.
 -- ============================================
-local function stopRapidFire()
-    if rapidFireConn then
-        rapidFireConn:Disconnect()
-        rapidFireConn = nil
+-- Rapid Fire (Melee): accelerates melee swings and optionally speeds local animation playback
+local function stopRapidFireMelee()
+    if rapidFireMeleeConn then
+        rapidFireMeleeConn:Disconnect()
+        rapidFireMeleeConn = nil
     end
-    rapidFireLastSwing = 0
-    rapidFireActive = false
+    rapidFireMeleeLastSwing = 0
+    rapidFireMeleeActive = false
+    resetRapidFireErrorCounts()
 end
 
-local function startRapidFire()
-    stopRapidFire()
-    rapidFireActive = true
+local function speedUpLocalMeleeAnimation(mult)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    local animator = humanoid:FindFirstChildOfClass("Animator")
+    if not animator then return end
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local ok, name = pcall(function() return tostring(track.Name):lower() end)
+        local n = ok and name or ""
+        if n:find("swing") or n:find("attack") or n:find("hit") then
+            pcall(function()
+                local orig = nil
+                if track.GetAttribute then orig = track:GetAttribute("__origPlaySpeed") end
+                if not orig then
+                    orig = track.PlaybackSpeed or 1
+                    if track.SetAttribute then pcall(function() track:SetAttribute("__origPlaySpeed", orig) end) end
+                end
+                track.PlaybackSpeed = (orig or 1) * mult
+            end)
+        end
+    end
+end
 
-    rapidFireConn = RunService.Heartbeat:Connect(function()
-        if not Toggles.RapidFire or not Toggles.RapidFire.Value then return end
+local function startRapidFireMelee()
+    stopRapidFireMelee()
+    rapidFireMeleeActive = true
+
+    rapidFireMeleeConn = RunService.Heartbeat:Connect(function()
+        if not Toggles.RapidFireMelee or not Toggles.RapidFireMelee.Value then return end
         if Toggles.KillAura and Toggles.KillAura.Value then return end
 
         local char = LocalPlayer.Character
@@ -1294,10 +1540,13 @@ local function startRapidFire()
 
         local now = tick()
         local weaponSpeed = getWeaponSwingSpeed()
-        local multiplier = performanceConfig.rapidFireMultiplier or 1
+        local multiplier = performanceConfig.rapidFireMeleeMultiplier or 1
         local rapidDelay = math.max(weaponSpeed / multiplier, performanceConfig.maxRapidFireRate)
+        -- Enforce safety cap on maximum attacks per second
+        local minDelayBySafety = 1 / (performanceConfig.safetyMaxAttacksPerSecond or 12)
+        rapidDelay = math.max(rapidDelay, minDelayBySafety)
 
-        if now - rapidFireLastSwing < rapidDelay then return end
+        if now - rapidFireMeleeLastSwing < rapidDelay then return end
 
         local targets = {}
         if hitTargets or remoteClick then
@@ -1327,11 +1576,148 @@ local function startRapidFire()
         end
 
         if success then
-            rapidFireLastSwing = now
+            -- record interval statistics
+            if rapidFireMeleeLastSwing and rapidFireMeleeLastSwing > 0 then
+                local interval = now - rapidFireMeleeLastSwing
+                table.insert(rapidFireMeleeStats.intervals, interval)
+                if #rapidFireMeleeStats.intervals > 12 then table.remove(rapidFireMeleeStats.intervals, 1) end
+            end
+            rapidFireMeleeLastSwing = now
+            -- locally speed up any playing melee animation for more responsive feel
+            local animMult = (Options.MeleeAnimSpeed and Options.MeleeAnimSpeed.Value) or multiplier
+            pcall(function() speedUpLocalMeleeAnimation(math.max(animMult, 0.01)) end)
+            -- Auto-tune multiplier if enabled
+            if Toggles.RapidFireMeleeAutoTune and Toggles.RapidFireMeleeAutoTune.Value then
+                -- compute average interval
+                local sum = 0
+                for _, v in ipairs(rapidFireMeleeStats.intervals) do sum = sum + v end
+                local avg = (#rapidFireMeleeStats.intervals > 0) and (sum / #rapidFireMeleeStats.intervals) or nil
+                if avg and avg > 0 then
+                    -- desired multiplier to reach weaponSpeed: desired = current * (weaponSpeed / avg)
+                    local desired = (performanceConfig.rapidFireMeleeMultiplier or 1) * (weaponSpeed / avg)
+                    local rate = Options.RapidFireMeleeAutoTuneRate and Options.RapidFireMeleeAutoTuneRate.Value or rapidFireAutoTuneAdjust
+                    -- lerp current multiplier towards desired
+                    local cur = performanceConfig.rapidFireMeleeMultiplier or 1
+                    local nextMult = cur + (desired - cur) * math.clamp(rate, 0.01, 0.5)
+                    -- clamp to safe range
+                    nextMult = math.clamp(nextMult, 1.0, 4.0)
+                    performanceConfig.rapidFireMeleeMultiplier = nextMult
+                end
+            end
         else
-            warn("[RapidFire] Attack error: " .. tostring(err))
+            warn("[RapidFireMelee] Attack error: " .. tostring(err))
+            -- record error and apply safety reduction if repeated
+            local now = tick()
+            rapidFireErrorCounts.melee.count = rapidFireErrorCounts.melee.count + 1
+            rapidFireErrorCounts.melee.last = now
+            -- if 3 errors within 5s, reduce multiplier
+            if rapidFireErrorCounts.melee.count >= 3 and (now - (rapidFireErrorCounts.melee.firstError or now) ) <= 5 then
+                performanceConfig.rapidFireMeleeMultiplier = math.max(1.0, (performanceConfig.rapidFireMeleeMultiplier or 1) * 0.7)
+                Library:Notify({ Title = "RapidFire", Description = "Repeated errors detected — lowering melee multiplier for safety.", Time = 3 })
+                rapidFireErrorCounts.melee.count = 0
+            else
+                if not rapidFireErrorCounts.melee.firstError then rapidFireErrorCounts.melee.firstError = now end
+            end
         end
     end)
+end
+
+-- Rapid Fire (Ranged): attempts to repeatedly fire ranged tool remotes (RemoteClick/Fire)
+local function stopRapidFireRanged()
+    if rapidFireRangedConn then
+        rapidFireRangedConn:Disconnect()
+        rapidFireRangedConn = nil
+    end
+    rapidFireRangedLastFire = 0
+    rapidFireRangedActive = false
+    resetRapidFireErrorCounts()
+end
+
+local function detectRangedFireRemote(tool)
+    if not tool then return nil end
+    local candidates = {"Fire","FireServer","Shoot","RemoteClick","Trigger","FireProjectile"}
+    for _, name in ipairs(candidates) do
+        local r = tool:FindFirstChild(name)
+        if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    end
+    -- fallback: find any RemoteEvent/Function under tool
+    for _, child in ipairs(tool:GetDescendants()) do
+        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+            return child
+        end
+    end
+    return nil
+end
+
+local function startRapidFireRanged()
+    stopRapidFireRanged()
+    rapidFireRangedActive = true
+
+    rapidFireRangedConn = RunService.Heartbeat:Connect(function()
+        if not Toggles.RapidFireRanged or not Toggles.RapidFireRanged.Value then return end
+
+        local char = LocalPlayer.Character
+        if not char then return end
+        local tool = char:FindFirstChildOfClass("Tool")
+        if not tool then return end
+
+        local fireRemote = detectRangedFireRemote(tool)
+        if not fireRemote then return end
+
+        local now = tick()
+        -- attempt to infer a base fire rate; ranged weapons often faster than melee
+        local baseRate = 0.25
+        local multiplier = performanceConfig.rapidFireRangedMultiplier or 1
+        local fireDelay = math.max(baseRate / multiplier, performanceConfig.maxRapidFireRate)
+        -- safety cap
+        local minDelayBySafety = 1 / (performanceConfig.safetyMaxAttacksPerSecond or 12)
+        fireDelay = math.max(fireDelay, minDelayBySafety)
+        if now - rapidFireRangedLastFire < fireDelay then return end
+
+        local success, err = pcall(function()
+            -- If auto-aim-fire enabled and aimbot has a target, try passing the target
+            if Toggles.RapidFireRangedAutoAim and Toggles.RapidFireRangedAutoAim.Value and aimbotTarget and aimbotTarget.character then
+                local ok, e = pcall(function()
+                    if fireRemote:IsA("RemoteEvent") then
+                        fireRemote:FireServer(aimbotTarget.character)
+                    else
+                        fireRemote:InvokeServer(aimbotTarget.character)
+                    end
+                end)
+                if ok then return true end
+                -- fallback to plain fire if passing target failed
+            end
+            if fireRemote:IsA("RemoteEvent") then
+                fireRemote:FireServer()
+            else
+                fireRemote:InvokeServer()
+            end
+        end)
+        if success then
+            rapidFireRangedLastFire = now
+        else
+            warn("[RapidFireRanged] Fire error: " .. tostring(err))
+            local now = tick()
+            rapidFireErrorCounts.ranged.count = rapidFireErrorCounts.ranged.count + 1
+            rapidFireErrorCounts.ranged.last = now
+            if rapidFireErrorCounts.ranged.count >= 3 and (now - (rapidFireErrorCounts.ranged.firstError or now)) <= 5 then
+                performanceConfig.rapidFireRangedMultiplier = math.max(1.0, (performanceConfig.rapidFireRangedMultiplier or 1) * 0.7)
+                Library:Notify({ Title = "RapidFire", Description = "Repeated errors detected — lowering ranged multiplier for safety.", Time = 3 })
+                rapidFireErrorCounts.ranged.count = 0
+            else
+                if not rapidFireErrorCounts.ranged.firstError then rapidFireErrorCounts.ranged.firstError = now end
+            end
+        end
+    end)
+end
+
+local function resetRapidFireErrorCounts()
+    rapidFireErrorCounts.melee.count = 0
+    rapidFireErrorCounts.melee.firstError = nil
+    rapidFireErrorCounts.melee.last = 0
+    rapidFireErrorCounts.ranged.count = 0
+    rapidFireErrorCounts.ranged.firstError = nil
+    rapidFireErrorCounts.ranged.last = 0
 end
 
 -- ============================================
@@ -1485,6 +1871,19 @@ local function getWeaponSwingSpeed()
     end
     
     -- Default speed for unknown weapons
+    -- Try to infer from common attributes or child values
+    local tryAttrs = {
+        tool:GetAttribute("AttackSpeed"),
+        tool:GetAttribute("SwingSpeed"),
+        tool:FindFirstChild("AttackSpeed") and tonumber(tool:FindFirstChild("AttackSpeed").Value) or nil,
+        tool:FindFirstChild("Cooldown") and tonumber(tool:FindFirstChild("Cooldown").Value) or nil,
+    }
+    for _, v in ipairs(tryAttrs) do
+        if v and type(v) == "number" and v > 0 then
+            return tonumber(v)
+        end
+    end
+
     return 0.5
 end
 
@@ -1709,7 +2108,7 @@ local function startKillAura()
             -- We NEVER swing faster than the weapon physically allows.
             -- This prevents the server from rejecting rapid-fire hits.
             local weaponSpeed        = getWeaponSwingSpeed()
-            local rapidFactor        = (Toggles.RapidFire and Toggles.RapidFire.Value) and performanceConfig.rapidFireMultiplier or 1
+            local rapidFactor        = (Toggles.RapidFireMelee and Toggles.RapidFireMelee.Value) and performanceConfig.rapidFireMeleeMultiplier or 1
             local adjustedWeaponSpeed = math.max(weaponSpeed / rapidFactor, performanceConfig.maxRapidFireRate)
             local userSwingRate      = Options.KillAuraSwingRate and Options.KillAuraSwingRate.Value or adjustedWeaponSpeed
             local effectiveSwingRate = math.max(adjustedWeaponSpeed, userSwingRate)
@@ -3150,14 +3549,8 @@ danceGroup:AddDropdown("DanceStyle", {
 -- Update Notice groupbox
 local updateNoticeGroup = Tabs.Player:AddRightGroupbox("Update Notice", "info")
 
-updateNoticeGroup:AddLabel("I tried everything, but Speed Hack, Fly,")
-updateNoticeGroup:AddLabel("and Bring Pickup Item could not be made")
-updateNoticeGroup:AddLabel("to work. The server validates positions too")
-updateNoticeGroup:AddLabel("aggressively to do anything with them.")
-updateNoticeGroup:AddLabel("")
-updateNoticeGroup:AddLabel("I still hope everyone enjoys this script,")
-updateNoticeGroup:AddLabel("even if a few of the best features no")
-updateNoticeGroup:AddLabel("longer work. Have fun!")
+updateNoticeGroup:AddLabel("Note: Some features depend on the game's server-side validation and may behave differently across places.")
+updateNoticeGroup:AddLabel("Use toggles to test which methods work best in your current session.")
 
 end -- Player Tab local scope
 
@@ -3236,32 +3629,132 @@ killAuraStatusLabel = killAuraGroup:AddLabel("Current Target: none", { DoesWrap 
 
 killAuraGroup:AddDivider()
 
-killAuraGroup:AddToggle("RapidFire", {
-    Text = "Rapid Fire (Attack Speed)",
+killAuraGroup:AddToggle("RapidFireMelee", {
+    Text = "Rapid Fire (Melee)",
     Default = false,
-    Tooltip = "Accelerate your attacks by multiplying swing speed. Works with any melee weapon.",
+    Tooltip = "Accelerate melee swings by multiplying swing speed.",
     Callback = function(state)
         if state then
-            startRapidFire()
-            Library:Notify({ Title = "Rapid Fire", Description = "Enabled - faster attacks!", Time = 2 })
+            startRapidFireMelee()
+            Library:Notify({ Title = "Rapid Fire (Melee)", Description = "Enabled - faster melee attacks!", Time = 2 })
         else
-            stopRapidFire()
+            stopRapidFireMelee()
         end
     end,
 })
 
-killAuraGroup:AddSlider("RapidFireMultiplier", {
-    Text = "Attack Speed Multiplier",
+killAuraGroup:AddSlider("RapidFireMeleeMultiplier", {
+    Text = "Melee Attack Speed Multiplier",
     Default = 1.5,
     Min = 1.0,
     Max = 3.0,
     Rounding = 2,
     Suffix = "x",
-    Tooltip = "How fast to attack. 1.5x = 50% faster, 2x = 2x speed, etc.",
+    Tooltip = "Melee attack speed multiplier.",
     Callback = function(v)
-        performanceConfig.rapidFireMultiplier = v
+        performanceConfig.rapidFireMeleeMultiplier = v
     end,
 })
+
+killAuraGroup:AddToggle("RapidFireRanged", {
+    Text = "Rapid Fire (Ranged)",
+    Default = false,
+    Tooltip = "Attempt to repeatedly fire ranged weapon remotes.",
+    Callback = function(state)
+        if state then
+            startRapidFireRanged()
+            Library:Notify({ Title = "Rapid Fire (Ranged)", Description = "Enabled - faster ranged fire!", Time = 2 })
+        else
+            stopRapidFireRanged()
+        end
+    end,
+})
+
+killAuraGroup:AddSlider("RapidFireRangedMultiplier", {
+    Text = "Ranged Fire Multiplier",
+    Default = 1.2,
+    Min = 1.0,
+    Max = 3.0,
+    Rounding = 2,
+    Suffix = "x",
+    Tooltip = "Ranged fire rate multiplier.",
+    Callback = function(v)
+        performanceConfig.rapidFireRangedMultiplier = v
+    end,
+})
+
+killAuraGroup:AddToggle("WeaponInspector", {
+    Text = "Weapon Inspector",
+    Default = false,
+    Tooltip = "Prints info about equipped weapons (inferred speeds, remotes) to the console.",
+    Callback = function(state)
+        if state then
+            startWeaponInspector()
+            Library:Notify({ Title = "Weapon Inspector", Description = "Enabled - check console for details", Time = 2 })
+        else
+            stopWeaponInspector()
+            Library:Notify({ Title = "Weapon Inspector", Description = "Disabled", Time = 2 })
+        end
+    end,
+})
+
+    killAuraGroup:AddSlider("MeleeAnimSpeed", {
+        Text = "Melee Anim Speed",
+        Default = 1.25,
+        Min = 0.5,
+        Max = 3.0,
+        Rounding = 2,
+        Tooltip = "Local animation playback speed multiplier for melee attacks.",
+        Callback = function(v)
+            -- applied dynamically when attacks occur
+        end,
+    })
+
+    killAuraGroup:AddToggle("RapidFireMeleeAutoTune", {
+        Text = "Auto-Tune RapidFire (Melee)",
+        Default = false,
+        Tooltip = "Automatically adjust melee multiplier to match weapon's natural speed.",
+        Callback = function(state)
+            if state then
+                Library:Notify({ Title = "Auto-Tune", Description = "Enabled - tuning melee multiplier", Time = 2 })
+            else
+                Library:Notify({ Title = "Auto-Tune", Description = "Disabled", Time = 2 })
+            end
+        end,
+    })
+
+    killAuraGroup:AddSlider("RapidFireMeleeAutoTuneRate", {
+        Text = "Auto-Tune Rate",
+        Default = 0.05,
+        Min = 0.01,
+        Max = 0.5,
+        Rounding = 3,
+        Tooltip = "How aggressively to adjust the melee multiplier (0.01-0.5).",
+        Callback = function(v)
+            -- stored in Options for runtime access
+        end,
+    })
+
+    killAuraGroup:AddToggle("RapidFireRangedAutoAim", {
+        Text = "Ranged Auto-Fire with Aimbot",
+        Default = false,
+        Tooltip = "When aimbot has a target, auto-fire ranged tool remotes.",
+        Callback = function(state)
+            Library:Notify({ Title = "Ranged Auto-Fire", Description = state and "Enabled" or "Disabled", Time = 2 })
+        end,
+    })
+
+    killAuraGroup:AddSlider("SafetyMaxAPS", {
+        Text = "Max Attacks/sec (Safety)",
+        Default = 12,
+        Min = 4,
+        Max = 30,
+        Rounding = 0,
+        Tooltip = "Safety cap for maximum attacks/fires per second to reduce detection risk.",
+        Callback = function(v)
+            performanceConfig.safetyMaxAttacksPerSecond = v
+        end,
+    })
 
 killAuraGroup:AddToggle("AntiLag", {
     Text = "Anti-Lag Mode",
@@ -3373,6 +3866,55 @@ aimbotGroup:AddToggle("AimbotFOVCircle", {
 })
 
 aimbotStatusLabel = aimbotGroup:AddLabel("Current Target: none", { DoesWrap = true })
+
+-- Weapon Info / Presets (right side)
+local weaponInfoGroup = Tabs.Combat:AddRightGroupbox("Weapon Info", "info")
+weaponInfoNameLabel = weaponInfoGroup:AddLabel("Equipped: none", { DoesWrap = true })
+weaponInfoSpeedLabel = weaponInfoGroup:AddLabel("Inferred Speed: -", { DoesWrap = true })
+weaponInfoSuggestedLabel = weaponInfoGroup:AddLabel("Suggested Mult: -", { DoesWrap = true })
+
+weaponInfoGroup:AddButton("Save Preset (Equipped)", function()
+    savePresetForEquipped()
+end)
+
+weaponInfoPresetDropdown = weaponInfoGroup:AddDropdown("WeaponPresetSelect", {
+    Values = {},
+    Default = 1,
+    Text = "Presets",
+    Tooltip = "Select a saved preset to apply",
+})
+
+weaponInfoGroup:AddButton("Apply Selected Preset", function()
+    local sel = Options.WeaponPresetSelect and Options.WeaponPresetSelect.Value or nil
+    if sel and sel ~= "" then
+        applyPresetForEquipped(sel)
+    else
+        Library:Notify({ Title = "Preset", Description = "No preset selected", Time = 2 })
+    end
+end)
+
+weaponInfoGroup:AddButton("Apply Preset (Equipped Name)", function()
+    applyPresetForEquipped()
+end)
+
+-- Ensure UI updates periodically
+task.spawn(function()
+    while not Library.Unloaded do
+        pcall(updateWeaponInfoUI)
+        task.wait(1)
+    end
+end)
+
+weaponInfoGroup:AddButton("Export Presets (Console)", function()
+    local ok, json = pcall(function() return HttpService:JSONEncode(weaponPresets) end)
+    if ok then
+        print("[WeaponPresets] " .. json)
+        pcall(function() if setclipboard then setclipboard(json) end end)
+        Library:Notify({ Title = "Presets", Description = "Exported presets to console (and clipboard if available).", Time = 3 })
+    else
+        Library:Notify({ Title = "Presets", Description = "Failed to export presets.", Time = 3 })
+    end
+end)
 
 end -- Combat Tab local scope
 
@@ -3660,6 +4202,91 @@ fpsUnlockerGroup:AddToggle("FPSUnlock", {
 
 end -- Misc Tab local scope
 
+    -- ============================================
+    -- KEYBINDS & SCRIPT LOG UI (Misc additions)
+    -- ============================================
+    do
+        local keyGroup = Tabs.Misc:AddLeftGroupbox("Keybinds", "keyboard")
+
+        keyGroup:AddKeyPicker("Bind_RapidFireMelee", { Default = "K", Text = "RapidFire Melee Key" })
+        keyGroup:AddKeyPicker("Bind_RapidFireRanged", { Default = "J", Text = "RapidFire Ranged Key" })
+        keyGroup:AddKeyPicker("Bind_KillAura", { Default = "U", Text = "Kill Aura Key" })
+        keyGroup:AddKeyPicker("Bind_Aimbot", { Default = "I", Text = "Aimbot Key" })
+        keyGroup:AddKeyPicker("Bind_AutoPickup", { Default = "O", Text = "AutoPickup Key" })
+        keyGroup:AddKeyPicker("Bind_RepairAura", { Default = "P", Text = "Repair Aura Key" })
+        keyGroup:AddKeyPicker("Bind_FunnyDance", { Default = "L", Text = "Funny Dance Key" })
+
+        keyGroup:AddDivider()
+        keyGroup:AddLabel("Press a key to toggle the corresponding feature.")
+
+        local function toggleByName(name)
+            if name == "RapidFireMelee" then
+                if Toggles.RapidFireMelee then
+                    if Toggles.RapidFireMelee.Value then stopRapidFireMelee() else startRapidFireMelee() end
+                    if Toggles.RapidFireMelee then Toggles.RapidFireMelee.Value = not Toggles.RapidFireMelee.Value end
+                end
+            elseif name == "RapidFireRanged" then
+                if Toggles.RapidFireRanged then
+                    if Toggles.RapidFireRanged.Value then stopRapidFireRanged() else startRapidFireRanged() end
+                    if Toggles.RapidFireRanged then Toggles.RapidFireRanged.Value = not Toggles.RapidFireRanged.Value end
+                end
+            elseif name == "KillAura" then
+                if Toggles.KillAura then Toggles.KillAura.Value = not Toggles.KillAura.Value end
+            elseif name == "Aimbot" then
+                if Toggles.Aimbot then Toggles.Aimbot.Value = not Toggles.Aimbot.Value end
+            elseif name == "AutoPickup" then
+                if Toggles.AutoPickup then Toggles.AutoPickup.Value = not Toggles.AutoPickup.Value end
+            elseif name == "RepairAura" then
+                if Toggles.RepairAura then Toggles.RepairAura.Value = not Toggles.RepairAura.Value end
+            elseif name == "FunnyDance" then
+                if Toggles.FunnyDance then Toggles.FunnyDance.Value = not Toggles.FunnyDance.Value end
+            end
+        end
+
+        local keybindConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+            if gameProcessed then return end
+            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            local keyName = input.KeyCode.Name
+            -- check each bind option in Options
+            local map = {
+                Bind_RapidFireMelee = "RapidFireMelee",
+                Bind_RapidFireRanged = "RapidFireRanged",
+                Bind_KillAura = "KillAura",
+                Bind_Aimbot = "Aimbot",
+                Bind_AutoPickup = "AutoPickup",
+                Bind_RepairAura = "RepairAura",
+                Bind_FunnyDance = "FunnyDance",
+            }
+            for optKey, actionName in pairs(map) do
+                local opt = Options[optKey]
+                if opt and opt.Value == keyName then
+                    addScriptLog("KEY", "Key pressed: " .. keyName .. " -> " .. actionName)
+                    toggleByName(actionName)
+                end
+            end
+        end)
+        table.insert(connections, keybindConn)
+
+        -- Script Log group
+        local logGroup = Tabs.Misc:AddRightGroupbox("Script Log", "clipboard")
+        logGroup:AddToggle("ShowLogPanel", {
+            Text = "Show Log Panel",
+            Default = false,
+            Callback = function(s)
+                toggleLogGui()
+            end,
+        })
+        logGroup:AddButton("Clear Logs", function()
+            clearScriptLogs()
+            Library:Notify({ Title = "Script Log", Description = "Cleared logs", Time = 2 })
+        end)
+        logGroup:AddButton("Run Self-Test", function()
+            local ok = runSelfTest()
+            Library:Notify({ Title = "Self-Test", Description = ok and "All checks passed (see log)" or "Some checks failed (see log)", Time = 3 })
+        end)
+
+    end
+
 -- ============================================
 -- UNLOAD CLEANUP
 -- [CHANGED] Cleans up all 6 category ESP systems
@@ -3706,7 +4333,8 @@ Library:OnUnload(function()
     stopBhop()        -- [ADDED v7.3] Clean up bunny hop on unload
     stopFunnyDance()  -- Clean up funny dance on unload
     stopRemoteSpy()   -- [ADDED v7.3] Clean up remote spy on unload
-    stopRapidFire()   -- [ADDED v8.4] Clean up rapid fire
+    stopRapidFireMelee()   -- [ADDED v8.4] Clean up rapid fire melee
+    stopRapidFireRanged()  -- [ADDED v8.4] Clean up rapid fire ranged
     stopAntiLag()     -- [ADDED v8.4] Clean up anti-lag
     stopAutoRejoin()  -- [ADDED v8.4] Clean up auto rejoin
     -- [ADDED v7.3.3] Restore FPS cap on unload
@@ -3866,4 +4494,31 @@ local espCounts = { Gun="Red", Melee="Orange", Medical="Green", Armor="Blue", Fo
 print("LKHUB v1.0 loaded | " .. #itemNames .. " items tracked | Right Shift = menu")
 for cat, col in pairs(espCounts) do
     print(string.format("  %s ESP (%s) - %d items", cat, col, #espSystems[cat].items))
+end
+
+local function printEquippedWeaponInfo()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then
+        print("[WeaponInspector] No tool equipped.")
+        return
+    end
+    print("[WeaponInspector] Equipped tool:", tool.Name)
+    print("  -> Known mapping speed:", weaponSwingSpeeds[tool.Name] or "n/a")
+    local inferred = getWeaponSwingSpeed()
+    print("  -> Inferred swing/fire speed:", inferred)
+    -- List relevant attributes/children
+    for _, key in ipairs({"AttackSpeed","SwingSpeed","Cooldown"}) do
+        local a = tool:GetAttribute(key)
+        if a ~= nil then print("  -> Attribute ", key, "=", a) end
+        local c = tool:FindFirstChild(key)
+        if c and c.Value then print("  -> Child ", key, "Value=", c.Value) end
+    end
+    -- List remotes inside tool (ranged indicators)
+    for _, child in ipairs(tool:GetDescendants()) do
+        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+            print(string.format("  -> Remote found: %s (%s)", child.Name, child.ClassName))
+        end
+    end
 end
