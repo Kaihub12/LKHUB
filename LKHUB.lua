@@ -36,12 +36,52 @@ local resetRemote = Remotes and Remotes:FindFirstChild("Misc") and Remotes.Misc:
 local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 local Library, ThemeManager, SaveManager
 
-local function safeLoadLib(path)
+local function fetchUrl(path)
+    local result
     local ok, res = pcall(function()
-        return loadstring(game:HttpGet(path))()
+        if type(game.HttpGet) == "function" then
+            return game:HttpGet(path)
+        elseif type(game.GetService) == "function" and HttpService then
+            return HttpService:GetAsync(path)
+        elseif syn and syn.request then
+            local r = syn.request({Url = path, Method = "GET"})
+            return r and r.Body
+        elseif http_request then
+            local r = http_request({Url = path, Method = "GET"})
+            return r and r.Body
+        elseif request then
+            local r = request({Url = path, Method = "GET"})
+            return r and r.Body
+        end
     end)
+    if ok and res and type(res) == "string" then
+        return res
+    end
+    return nil, res
+end
+
+local function safeLoadLib(path)
+    local source, err = fetchUrl(path)
+    if not source then
+        warn("[LKHUB] Failed to fetch: " .. tostring(path) .. " (" .. tostring(err) .. ")")
+        return nil
+    end
+    local chunk, loadErr
+    if type(loadstring) == "function" then
+        chunk, loadErr = loadstring(source)
+    elseif type(load) == "function" then
+        chunk, loadErr = load(source)
+    else
+        warn("[LKHUB] No loadstring/load available to compile: " .. tostring(path))
+        return nil
+    end
+    if not chunk then
+        warn("[LKHUB] Failed to compile: " .. tostring(path) .. " (" .. tostring(loadErr) .. ")")
+        return nil
+    end
+    local ok, res = pcall(chunk)
     if not ok then
-        warn("[LKHUB] Failed to load: " .. tostring(path) .. " (" .. tostring(res) .. ")")
+        warn("[LKHUB] Failed to run: " .. tostring(path) .. " (" .. tostring(res) .. ")")
         return nil
     end
     return res
