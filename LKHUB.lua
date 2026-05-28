@@ -34,9 +34,27 @@ local resetRemote = Remotes and Remotes:FindFirstChild("Misc") and Remotes.Misc:
 -- OBSIDIAN UI SETUP
 -- ============================================
 local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
-local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
-local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+local Library, ThemeManager, SaveManager
+
+local function safeLoadLib(path)
+    local ok, res = pcall(function()
+        return loadstring(game:HttpGet(path))()
+    end)
+    if not ok then
+        warn("[LKHUB] Failed to load: " .. tostring(path) .. " (" .. tostring(res) .. ")")
+        return nil
+    end
+    return res
+end
+
+Library = safeLoadLib(repo .. "Library.lua")
+ThemeManager = safeLoadLib(repo .. "addons/ThemeManager.lua")
+SaveManager = safeLoadLib(repo .. "addons/SaveManager.lua")
+
+if not Library then
+    warn("[LKHUB] UI library failed to load; aborting script initialization.")
+    return
+end
 
 local Options = Library.Options
 local Toggles = Library.Toggles
